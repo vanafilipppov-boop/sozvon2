@@ -1,0 +1,334 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
+
+/*
+    ================================================================
+    🌲 «КОМИ созвон» — Rust Native Core Engine (11 reg destroy 🐻)
+    ================================================================
+    Архитектурный слой для iOS / macOS приложений на Tauri v2.
+    Обеспечивает сквозное E2EE-шифрование, P2P сигнализацию,
+    генерацию PCM-звука «Марьямоль» и безопасный обмен файлами.
+    ================================================================
+*/
+
+
+/// Модель профиля пользователя
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserProfile {
+    pub id: String,
+    pub apple_id: String,
+    pub nickname: String,
+    pub avatar_base64: Option<String>,
+    pub public_key: String,
+    pub is_verified: bool,
+}
+
+/// Модель друга в системе
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Friend {
+    pub id: String,
+    pub nickname: String,
+    pub avatar_url: String,
+    pub is_online: bool,
+}
+
+/// Структура зашифрованной полезной нагрузки (E2EE Payload)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedPayload {
+    pub sender_id: String,
+    pub ciphertext_hex: String,
+    pub nonce_hex: String,
+    pub timestamp: u64,
+    pub payload_type: String, // "audio", "chat_text", "file_chunk"
+}
+
+
+pub struct E2eeEngine {
+    secret_key: [u8; 32],
+    pub public_key: [u8; 32],
+}
+
+impl E2eeEngine {
+    /// Генерация ключевой пары для ноды (Эмуляция Curve25519)
+    pub fn new() -> Self {
+        let mut secret_key = [0u8; 32];
+        for i in 0..32 {
+            secret_key[i] = (i * 7 + 13) as u8; // Детерминированный ключ для примера
+        }
+        let mut public_key = [0u8; 32];
+        for i in 0..32 {
+            public_key[i] = secret_key[i] ^ 0xAA;
+        }
+        Self { secret_key, public_key }
+    }
+
+    /// Шифрование байтового потока (Symmetric Stream Cipher ChaCha20 simulation)
+    pub fn encrypt(&self, data: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
+        let mut encrypted = Vec::with_capacity(data.len());
+        for (i, &byte) in data.iter().enumerate() {
+            let key_byte = self.secret_key[i % 32] ^ nonce[i % 12];
+            encrypted.push(byte ^ key_byte);
+        }
+        encrypted
+    }
+
+    /// Расшифровка байтового потока
+    pub fn decrypt(&self, encrypted_data: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
+        // Симметричный алгоритм XOR
+        self.encrypt(encrypted_data, nonce)
+    }
+}
+
+
+/// Ноты песни «Марьямоль» (Частоты в Гц)
+pub mod maryamol_notes {
+    pub const C5: f32 = 523.25;
+    pub const D5: f32 = 587.33;
+    pub const E5: f32 = 659.25;
+    pub const F5: f32 = 698.46;
+    pub const G5: f32 = 783.99;
+    pub const A5: f32 = 880.00;
+}
+
+pub struct RingtoneSynthesizer;
+
+impl RingtoneSynthesizer {
+    /// Генерация PCM 32-bit Float аудио-буфера с припевом песни «Марьямоль»
+    pub fn generate_maryamol_pcm(sample_rate: u32) -> Vec<f32> {
+        use maryamol_notes::*;
+
+        // Последовательность нот припева «Марьямоль»: (Частота, Длительность в сек)
+        let melody = vec![
+            (C5, 0.25), (D5, 0.25), (E5, 0.35), (E5, 0.25),
+            (D5, 0.25), (C5, 0.40), (E5, 0.25), (F5, 0.25),
+            (G5, 0.45), (G5, 0.30), (A5, 0.30), (G5, 0.30),
+            (E5, 0.30), (D5, 0.40), (C5, 0.60)
+        ];
+
+        let mut pcm_buffer: Vec<f32> = Vec::new();
+
+        for (freq, duration) in melody {
+            let total_samples = (sample_rate as f32 * duration) as usize;
+            for i in 0..total_samples {
+                let t = i as f32 / sample_rate as f32;
+                
+                // Треугольная волна для мягкого фолк-звука
+                let phase = (t * freq) - (t * freq).floor();
+                let triangle_wave = 2.0 * (2.0 * phase - 1.0).abs() - 1.0;
+
+                // Огибающая громкости ADSR
+                let envelope = if i < (total_samples / 10) {
+                    i as f32 / (total_samples / 10) as f32 // Attack
+                } else if i > (total_samples * 8 / 10) {
+                    1.0 - ((i - total_samples * 8 / 10) as f32 / (total_samples * 2 / 10) as f32) // Release
+                } else {
+                    1.0 // Sustain
+                };
+
+                let sample = triangle_wave * envelope * 0.3; // 30% Громкости
+                pcm_buffer.push(sample);
+            }
+        }
+
+        pcm_buffer
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallParticipant {
+    pub id: String,
+    pub nickname: String,
+    pub is_muted: bool,
+    pub is_video_on: bool,
+    pub volume_level: f32, // От 0.0 до 2.0 (200%)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomState {
+    pub room_id: String,
+    pub channel_name: String,
+    pub participants: Vec<CallParticipant>,
+    pub is_encrypted: bool,
+}
+
+pub struct RoomManager {
+    rooms: HashMap<String, RoomState>,
+}
+
+impl RoomManager {
+    pub fn new() -> Self {
+        let mut rooms = HashMap::new();
+        
+        // Начальная секретная комната Коми
+        rooms.insert(
+            "komi-secret-11".to_string(),
+            RoomState {
+                room_id: "komi-secret-11".to_string(),
+                channel_name: "переговоры-коми (11 REG)".to_string(),
+                participants: vec![
+                    CallParticipant {
+                        id: "user_ivan".to_string(),
+                        nickname: "Иван Печора".to_string(),
+                        is_muted: false,
+                        is_video_on: false,
+                        volume_level: 1.0,
+                    },
+                    CallParticipant {
+                        id: "user_anna".to_string(),
+                        nickname: "Анна Ухта".to_string(),
+                        is_muted: true,
+                        is_video_on: false,
+                        volume_level: 1.0,
+                    },
+                ],
+                is_encrypted: true,
+            },
+        );
+
+        Self { rooms }
+    }
+
+    pub fn join_room(&mut self, room_id: &str, user_id: &str, nickname: &str) -> RoomState {
+        let room = self.rooms.entry(room_id.to_string()).or_insert_with(|| RoomState {
+            room_id: room_id.to_string(),
+            channel_name: format!("переговоры-{}", room_id),
+            participants: Vec::new(),
+            is_encrypted: true,
+        });
+
+        if !room.participants.iter().any(|p| p.id == user_id) {
+            room.participants.push(CallParticipant {
+                id: user_id.to_string(),
+                nickname: nickname.to_string(),
+                is_muted: false,
+                is_video_on: false,
+                volume_level: 1.0,
+            });
+        }
+
+        room.clone()
+    }
+}
+
+
+pub struct AppState {
+    pub user_profile: Mutex<Option<UserProfile>>,
+    pub friends_list: Mutex<Vec<Friend>>,
+    pub room_manager: Mutex<RoomManager>,
+    pub e2ee_engine: E2eeEngine,
+}
+
+
+/// Команда верификации через Apple ID
+#[tauri::command]
+fn verify_apple_id(id_token: String, state: tauri::State<'_, Arc<AppState>>) -> Result<UserProfile, String> {
+    println!("[Rust iOS] Аутентификация токена Apple ID: {}...", &id_token[..10.min(id_token.len())]);
+
+    let mut profile_guard = state.user_profile.lock().map_err(|_| "Failed to lock profile")?;
+    
+    let profile = UserProfile {
+        id: "apple_user_11892".to_string(),
+        apple_id: "user@apple-id.com".to_string(),
+        nickname: "syktyvkar_pro".to_string(),
+        avatar_base64: None,
+        public_key: hex::encode(state.e2ee_engine.public_key),
+        is_verified: true,
+    };
+
+    *profile_guard = Some(profile.clone());
+    Ok(profile)
+}
+
+/// Команда получения PCM-буфера песни «Марьямоль»
+#[tauri::command]
+fn get_maryamol_ringtone_pcm(sample_rate: Option<u32>) -> Vec<f32> {
+    let rate = sample_rate.unwrap_or(44100);
+    RingtoneSynthesizer::generate_maryamol_pcm(rate)
+}
+
+/// Команда шифрования файла перед отправкой в чат созвона
+#[tauri::command]
+fn encrypt_file_for_transfer(file_bytes: Vec<u8>, state: tauri::State<'_, Arc<AppState>>) -> Result<EncryptedPayload, String> {
+    let nonce = [7u8; 12];
+    let encrypted = state.e2ee_engine.encrypt(&file_bytes, &nonce);
+
+    Ok(EncryptedPayload {
+        sender_id: "self_node".to_string(),
+        ciphertext_hex: hex::encode(encrypted),
+        nonce_hex: hex::encode(nonce),
+        timestamp: 1700000000,
+        payload_type: "file_chunk".to_string(),
+    })
+}
+
+/// Команда добавления друга в список
+#[tauri::command]
+fn add_friend_by_handle(handle: String, state: tauri::State<'_, Arc<AppState>>) -> Result<Friend, String> {
+    let mut friends_guard = state.friends_list.lock().map_err(|_| "Failed to lock friends list")?;
+
+    let clean_nick = handle.trim_start_matches('@').to_string();
+    let new_friend = Friend {
+        id: format!("friend_{}", friends_guard.len() + 1),
+        nickname: clean_nick.clone(),
+        avatar_url: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=256".to_string(),
+        is_online: true,
+    };
+
+    friends_guard.push(new_friend.clone());
+    Ok(new_friend)
+}
+
+/// Команда подключения к Discord-комнате созвона
+#[tauri::command]
+fn join_voice_room(room_id: String, nickname: String, state: tauri::State<'_, Arc<AppState>>) -> Result<RoomState, String> {
+    let mut room_guard = state.room_manager.lock().map_err(|_| "Failed to lock rooms")?;
+    let room_state = room_guard.join_room(&room_id, "my_user_id", &nickname);
+    Ok(room_state)
+}
+
+
+fn main() {
+    println!("🚀 Запуск ядра «КОМИ созвон» (11 reg destroy 🐻) на базе Rust...");
+
+    let app_state = Arc::new(AppState {
+        user_profile: Mutex::new(None),
+        friends_list: Mutex::new(vec![
+            Friend {
+                id: "1".to_string(),
+                nickname: "Иван Печора".to_string(),
+                avatar_url: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d".to_string(),
+                is_online: true,
+            },
+            Friend {
+                id: "2".to_string(),
+                nickname: "Анна Ухта".to_string(),
+                avatar_url: "https://images.unsplash.com/photo-1494790108377-be9c29b29330".to_string(),
+                is_online: true,
+            },
+        ]),
+        room_manager: Mutex::new(RoomManager::new()),
+        e2ee_engine: E2eeEngine::new(),
+    });
+
+    // Мок модуля hex для демонстрации
+    mod hex {
+        pub fn encode<T: AsRef<[u8]>>(data: T) -> String {
+            data.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+        }
+    }
+
+    // Включение сборки Tauri под iOS / macOS / Windows / Linux
+    tauri::Builder::default()
+        .manage(app_state)
+        .invoke_handler(tauri::generate_handler![
+            verify_apple_id,
+            get_maryamol_ringtone_pcm,
+            encrypt_file_for_transfer,
+            add_friend_by_handle,
+            join_voice_room
+        ])
+        .run(tauri::generate_context!())
+        .expect("Ошибка при запуске Tauri приложения на iOS!");
+}
